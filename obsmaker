@@ -1,0 +1,222 @@
+#!env python3
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime
+
+config = {
+    "releases_dir": "/home/samu/Projects/releases",
+    "author": "Samu Juvonen <samu.juvonen@gmail.com>",
+}
+
+class ProjectInfo:
+    def __init__(self, path):
+        self.__path = os.path.realpath(path)
+        self.__name = os.path.basename(self.__path)
+        self.__info = read_simple_config(os.path.join(self.path, ".obsmaker"))
+        self.__changes = read_changelog(os.path.join(self.path, "CHANGES"), os.path.join(self.path, ".git"))
+
+    @property
+    def path(self):
+        return self.__path
+
+    @property
+    def name(self):
+        return self.__name
+
+    @property
+    def version(self):
+        return self.__changes[0][0]
+
+    @property
+    def release(self):
+        if self.version == self.__info["version"]:
+            return int(self.__info["release"]) + 1
+        else:
+            return 1
+
+    @property
+    def whitelist(self):
+        return self.__info["whitelist"]
+
+    @property
+    def blacklist(self):
+        return self.__info["blacklist"]
+
+    @property
+    def changes(self):
+        return self.__changes
+
+def clone_project(project, force_package=False):
+    release_name = "-".join([os.path.basename(project.path), project.version])
+    release_dir = os.path.join(config["releases_dir"], release_name)
+
+    def filter_entries(cwd, entries):
+        cwd = cwd[len(project.path) + 1:]
+        if len(cwd) == 0:
+            return tuple(e for e in entries if e not in project.whitelist)
+        else:
+            return tuple(e for e in entries if os.path.join(cwd, e) in project.blacklist)
+
+    if force_package is True:
+        try:
+            shutil.rmtree(release_dir)
+        except FileNotFoundError:
+            pass
+
+    shutil.copytree(project.path, release_dir, ignore=filter_entries)
+
+    return release_dir
+
+def make_archive(project, release_dir):
+    working_dir = os.path.dirname(release_dir)
+    source_dir = os.path.basename(release_dir)
+    archive_path = os.path.join(working_dir, project.name + ".tar.gz")
+    subprocess.run(args=["tar", "-C", working_dir, "-czf", archive_path, source_dir])
+    return archive_path
+
+def file_checksum(path):
+    return hashlib.md5(open(path, "rb").read()).hexdigest()
+
+def read_simple_config(path):
+    parsed = {}
+    current = None
+    with open(path, "r") as info:
+        for line in info:
+            data = [d for d in line.strip().split(":") if len(d) > 0]
+            if len(data) == 2:
+                key, value = data
+                parsed[key] = value.strip()
+            else:
+                entry = data[0]
+                if entry[0] == "-":
+                    current.append(entry[1:].strip())
+                else:
+                    parsed[entry] = []
+                    current = parsed[entry]
+    return parsed
+
+def read_git_tag_times(git_dir):
+    git_tags_dir = os.path.join(git_dir, "refs", "tags")
+    commits = {}
+    entries = {}
+
+    for tag in os.listdir(git_tags_dir):
+        with open(os.path.join(git_tags_dir, tag)) as file:
+            commits[tag[1:]] = file.read().strip()
+
+    tags = list(commits.keys())
+
+    def parse_line(line):
+        first, _ = line.split("\t", maxsplit=1)
+        stamp, zone = first.split(" ")[-2:]
+        return datetime.fromtimestamp(int(stamp)), zone
+
+    with open(os.path.join(git_dir, "logs", "HEAD")) as mainlog:
+        last_line = None
+        for line in mainlog:
+            for t in tags:
+                if t in line:
+                    entries[t] = parse_line(line)
+                    tags.remove(t)
+                    break
+            if "commit" in line:
+                last_line = line
+
+        entries["head"] = parse_line(last_line)
+    return entries
+
+def read_changelog(path, git_dir):
+    git_tags = read_git_tag_times(git_dir)
+    entries = []
+    with open(path, "r") as logfile:
+        for line in logfile:
+            if line[0:7] == "Version":
+                version = line.strip()[8:-1]
+                time = git_tags[version] if len(entries) > 0 else git_tags["head"]
+                entries.append((version, time, []))
+            elif line[0] == "-":
+                entries[-1][2].append(line[1:].strip())
+    return entries
+
+def prepare_rpm(project, archive_path, rpmdir):
+    def prepare_changelog():
+        entries = []
+        for source in project.changes:
+            dtime, tzone = source[1]
+            entries += [
+                "* {0} {1} - {2}".format(dtime.strftime("%a %b %d %Y"), config["author"], source[0]),
+                "- {0}".format("\n- ".join(source[2]))
+            ]
+        return entries
+
+    def prepare_spec(path):
+        log_entries = prepare_changelog()
+
+        with open(path, "r") as in_file:
+            data = in_file.read()
+            data = re.sub(r"\b(Version: \s+) [\d\.]+\b", "\\1 {0}".format(project.version), data)
+            data = re.sub(r"\b(Release: \s+) \d+\b", "\\1 {0}".format(project.release), data)
+            (data, _) = data.split("%changelog", maxsplit=1)
+
+            data += "%changelog\n{0}\n".format("\n".join(log_entries))
+
+            with open(path, "w") as out_file:
+                out_file.write(data)
+
+    prepare_spec(os.path.join(rpmdir, project.name + ".spec"))
+
+def prepare_deb(project, archive_path, debdir):
+    def prepare_dsc(path):
+        line_checksum = "{0} {1} {2}".format(file_checksum(archive_path),
+            os.path.getsize(archive_path), os.path.basename(archive_path))
+
+        pattern_checksum = r"\b\w+ \d+ ({0})".format(re.escape(os.path.basename(archive_path)))
+
+        with open(path, "r") as in_file:
+            data = in_file.read()
+            data = re.sub(r"\bVersion: [\d\.]+\b", "Version: {0}".format(project.version), data)
+            data = re.sub(pattern_checksum, line_checksum, data)
+
+            with open(path, "w") as out_file:
+                out_file.write(data)
+                out_file.close()
+
+    def prepare_changelog(path):
+        with open(path, "w") as out_file:
+            entries = []
+            for source in project.changes:
+                dtime, tzone = source[1]
+                timestamp = "{0} {1}".format(dtime.strftime("%a %d %b %Y %H:%M:%S"), tzone)
+                entries += [
+                    "{0} {1}-{2} unstable; urgency=low".format(project.name, source[0], 1),
+                    "  * {0}".format("\n  * ".join(source[2])),
+                    " -- {0}  {1}".format(config["author"], timestamp),
+                    ""
+                ]
+
+            out_file.write("\n".join(entries))
+
+    prepare_dsc(os.path.join(debdir, project.name + ".dsc"))
+    prepare_changelog(os.path.join(debdir, "debian.changelog"))
+
+cmdparser = argparse.ArgumentParser(description="Juvonet Packager")
+cmdparser.add_argument("path", metavar="PROJECT_DIR", type=str, help="Project to package")
+cmdparser.add_argument("-f", help="Create package even if one for the same version exists already", action="store_true")
+
+args = cmdparser.parse_args()
+project = ProjectInfo(args.path)
+
+try:
+    release_dir = clone_project(project, args.f)
+    archive_path = make_archive(project, release_dir)
+
+    prepare_rpm(project, archive_path, os.path.join(project.path, "extra", "obs"))
+    prepare_deb(project, archive_path, os.path.join(project.path, "extra", "obs"))
+
+except FileExistsError:
+    print("error: Release directory '{0}' exists".format(release_dir))
